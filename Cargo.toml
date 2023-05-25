@@ -1,0 +1,5 @@
+[workspace]
+members = [
+	"db721-parser",
+	"db721-gen"
+]
