@@ -1,4 +1,6 @@
 use std::hash::Hash;
+use lazy_static::lazy_static;
+use std::sync::Mutex;
 /* 
 CREATE FOREIGN TABLE IF NOT EXISTS db721_farm
 (
@@ -18,6 +20,15 @@ use std::io::Read;
 use nom::{IResult, bytes::streaming::take};
 use serde_json::Value;
 use serde::{Serialize, Deserialize};
+
+lazy_static!(
+
+      pub static ref COLUMN_META: Mutex<HashMap<String, ColumnMeta>> = {
+        let mut m = Mutex::new(HashMap::new());
+        m
+    };
+
+);
 
 pub struct Parser {
     filename: String,
@@ -53,7 +64,7 @@ metadata["Columns"]["Column Name"]: column data (JSON dict)
             "max_len": only exists for str column; the max length of a string in this block (int)
 */
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockStats {
     num: u32,
     min: Value,
@@ -62,7 +73,7 @@ pub struct BlockStats {
     max_len: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Column {
     #[serde(rename = "type")]
     column_type: String,
@@ -74,16 +85,53 @@ pub struct Column {
 #[serde(rename_all = "PascalCase")]
 pub struct Metadata {
     table: String,
+    #[serde( deserialize_with = "column_maker")]
     columns: HashMap<String, Column>,
     #[serde(rename = "Max Values Per Block")]
     max_values_per_block: u32,
 }
 
+// The most frequently used column data
+#[derive(Debug)]
+pub struct ColumnMeta {
+    column_type: String,
+    start_offset: u32,
+    elem_size: u32, // size of the element in bytes
+}
+
+fn column_maker<'de, D>(deserializer: D) -> Result<HashMap<String, Column>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut map: HashMap<String, Column> = HashMap::new();
+    let value: Value = serde::Deserialize::deserialize(deserializer)?;
+    if let Value::Object(obj) = value {
+        for (key, value) in obj {
+            let column: Column = serde_json::from_value(value).unwrap();
+            map.insert(key.clone(), column.clone());
+
+            COLUMN_META.lock().unwrap().insert(key, ColumnMeta {
+                column_type: column.column_type.clone(),
+                start_offset: column.start_offset,
+                // FIXME: change this into dynamically calculated value
+                elem_size: match column.column_type.as_str() {
+                    "float" => 4,
+                    "int" => 4,
+                    "str" => 32,
+                    _ => panic!("Invalid column type"),
+                },
+            });
+        }
+    }
+    Ok(map)
+}
+
+
 impl Parser {
     pub fn new(filename: String, tablename: String) -> Parser {
         Parser {
-            filename,
-            tablename
+            filename: filename,
+            tablename: tablename,
         }
     }
 
@@ -92,6 +140,11 @@ impl Parser {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         Ok(buffer)
+    }
+    // How to store the raw data
+    fn parse_raw(rawdata: &[u8]) -> IResult<&[u8], &[u8]> {
+        take::<usize, &[u8], nom::error::Error<&[u8]>> (
+            24)(rawdata)
     }
 
     pub fn parse(&self) {
@@ -109,7 +162,18 @@ impl Parser {
         let json_str = std::str::from_utf8(meta).expect("DB721|Metadata: Invalid MetaData format");
         println!("json_str: {:?}", json_str);
         let json_struct: Metadata = serde_json::from_str(json_str).expect("DB721|Metadata: Invalid json format");
-        println!("meta_struct: {:?}", json_struct);
+        println!("meta_struct: {:#?}", json_struct);
+        println!("{:?}",COLUMN_META.lock().unwrap());
+        println!("raw size: {}", raw.len());
+
+        //parse_raw()
+        //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
+            //24)(raw).unwrap();
+        //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
+            //192)(s).unwrap();
+        //let name_str = std::str::from_utf8(s).expect("DB721|Metadata: Invalid MetaData format");
+        //println!("name_str: {:?}", name_str);
+        // float(4) str(32) float(4)
 
         
 
