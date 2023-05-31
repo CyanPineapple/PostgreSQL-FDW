@@ -1,4 +1,7 @@
+use std::char::from_u32_unchecked;
+use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::str::from_utf8;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 /* 
@@ -22,17 +25,20 @@ use serde_json::Value;
 use serde::{Serialize, Deserialize};
 
 lazy_static!(
-
-      pub static ref COLUMN_META: Mutex<HashMap<String, ColumnMeta>> = {
-        let mut m = Mutex::new(HashMap::new());
+        // column name as key
+      pub static ref COLUMN_META: Mutex<BTreeMap<usize, ColumnMeta>> = {
+        let mut m = Mutex::new(BTreeMap::new());
         m
     };
 
 );
 
-pub struct Parser {
+pub struct Parser<'par> {
     filename: String,
     tablename: String,
+    data: Vec<u8>,
+    // also start index as key
+    column_raw: HashMap<usize, &'par[u8]>,
 }
 
 /* 
@@ -77,7 +83,7 @@ pub struct BlockStats {
 pub struct Column {
     #[serde(rename = "type")]
     column_type: String,
-    start_offset: u32,
+    start_offset: usize,
     num_blocks: u32,
     block_stats: HashMap<String, BlockStats>,
 }
@@ -94,8 +100,8 @@ pub struct Metadata {
 // The most frequently used column data
 #[derive(Debug)]
 pub struct ColumnMeta {
+    column_name: String,
     column_type: String,
-    start_offset: u32,
     elem_size: u32, // size of the element in bytes
 }
 
@@ -110,9 +116,9 @@ where
             let column: Column = serde_json::from_value(value).unwrap();
             map.insert(key.clone(), column.clone());
 
-            COLUMN_META.lock().unwrap().insert(key, ColumnMeta {
+            COLUMN_META.lock().unwrap().insert(column.start_offset, ColumnMeta {
+                column_name: key,
                 column_type: column.column_type.clone(),
-                start_offset: column.start_offset,
                 // FIXME: change this into dynamically calculated value
                 elem_size: match column.column_type.as_str() {
                     "float" => 4,
@@ -127,11 +133,13 @@ where
 }
 
 
-impl Parser {
-    pub fn new(filename: String, tablename: String) -> Parser {
+impl<'par> Parser<'par> {
+    pub fn new(filename: String, tablename: String) -> Parser<'par> {
         Parser {
             filename: filename,
             tablename: tablename,
+            data: Vec::new(),
+            column_raw: HashMap::new(),
         }
     }
 
@@ -141,16 +149,34 @@ impl Parser {
         file.read_to_end(&mut buffer)?;
         Ok(buffer)
     }
-    // How to store the raw data
-    fn parse_raw(rawdata: &[u8]) -> IResult<&[u8], &[u8]> {
-        take::<usize, &[u8], nom::error::Error<&[u8]>> (
-            24)(rawdata)
+
+    // pushdowns: qual and sort. 
+    // qual stores an index, 
+    // sort needs an array of index, so we save indexes to b+ trees.
+    fn parse_raw (rawdata: &'par [u8], tempraw: &'par mut HashMap<usize, &'par[u8]>) {
+        let rawb = &*(COLUMN_META.lock().unwrap()); 
+        let mut offsets = vec![];
+        rawb.keys().for_each(|k| {
+            offsets.push(k);
+        });
+        let len = rawdata.len();
+        offsets.push(&len);
+        println!("{:#?}", offsets);
+        let mut curdata = rawdata;
+        offsets.windows(2).for_each(|w| {
+            let (i, o) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
+                w[1] - w[0])(curdata).unwrap();
+            curdata = i;
+            tempraw.insert(*w[0], o);
+        }); 
+        println!("{:?}", tempraw);
+
     }
 
-    pub fn parse(&self) {
+    pub fn parse(&'par mut self) {
         // three sections: raw meta and size
-        let file_contents = Parser::read_file_contents(&self.filename).unwrap();
-        let body_bytes = &file_contents[..];
+        self.data = Parser::read_file_contents(&self.filename).unwrap();
+        let body_bytes = &self.data[..];
         let (i, o) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
             body_bytes.len() - 4)(body_bytes).unwrap();
         println!("i: {:?}", i);
@@ -166,7 +192,8 @@ impl Parser {
         println!("{:?}",COLUMN_META.lock().unwrap());
         println!("raw size: {}", raw.len());
 
-        //parse_raw()
+        let tempraw = &mut self.column_raw;
+        Parser::parse_raw(raw, tempraw);
         //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
             //24)(raw).unwrap();
         //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
