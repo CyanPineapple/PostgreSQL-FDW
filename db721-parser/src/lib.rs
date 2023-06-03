@@ -5,11 +5,19 @@ mod tests {
 
     #[test]
     fn it_parses() {
-        let mut parser = parser::Parser::new(
+        let parser = parser::ParserBuilder::new(
             String::from("/home/polo/Polo/PostgreSQL-FDW/db721-gen/data-farms.db721"),
             String::from("Farm")
-        );
-        parser.parse();
+        )
+        //.parse()
+        //.build_index()
+        .build()
+        .unwrap();
         //println!("{:?}", parser.column_raw.clone());
+
+        let owner = parser.data.borrow_owner();
+        let dep = parser.data.borrow_dependent();
+        println!("{:#?}",owner);
+        println!("{:#?}",dep.0.get(&0));
     }
 }

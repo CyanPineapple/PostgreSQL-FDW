@@ -1,10 +1,13 @@
+use lazy_static::lazy_static;
+use self_cell::self_cell;
 use std::char::from_u32_unchecked;
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::os::unix::net::UnixDatagram;
+use std::rc::Rc;
 use std::str::from_utf8;
-use lazy_static::lazy_static;
 use std::sync::Mutex;
-/* 
+/*
 CREATE FOREIGN TABLE IF NOT EXISTS db721_farm
 (
     farm_name       varchar,
@@ -18,11 +21,11 @@ CREATE FOREIGN TABLE IF NOT EXISTS db721_farm
 );
 );
 */
-use std::{fs::File, collections::HashMap};
-use std::io::Read;
-use nom::{IResult, bytes::streaming::take};
+use nom::{bytes::streaming::take, IResult};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde::{Serialize, Deserialize};
+use std::io::Read;
+use std::{collections::HashMap, fs::File};
 
 lazy_static!(
         // column name as key
@@ -33,15 +36,62 @@ lazy_static!(
 
 );
 
-pub struct Parser<'par> {
-    filename: String,
-    tablename: String,
-    data: Vec<u8>,
-    // also start index as key
-    column_raw: HashMap<usize, &'par[u8]>,
+#[derive(Debug, Eq, PartialEq)]
+pub struct ColRaw<'a>(pub HashMap<usize, &'a [u8]>);
+
+self_cell!(
+    pub struct AstCell {
+        owner: Vec<u8>,
+
+        #[covariant]
+        dependent: ColRaw,
+    }
+
+    impl {Debug, Eq, PartialEq}
+);
+
+pub struct Parser {
+    pub tablename: String,
+    pub data: AstCell,
+    //data: Vec<u8>,
+    //// also start index as key
+    //column_raw: HashMap<usize, &'par[u8]>,
 }
 
-/* 
+impl Parser {
+    pub fn new(tablename: String, data: AstCell) -> Parser {
+        Parser {
+            tablename: tablename,
+            data: data,
+        }
+    }
+}
+
+pub struct ParserBuilder {
+    filename: String,
+    tablename: String,
+}
+
+// customize build error
+#[derive(Debug)]
+pub enum BuildError {
+    IoError(std::io::Error),
+    JsonError(serde_json::Error),
+}
+
+impl From<std::io::Error> for BuildError {
+    fn from(error: std::io::Error) -> Self {
+        BuildError::IoError(error)
+    }
+}
+
+impl From<serde_json::Error> for BuildError {
+    fn from(error: serde_json::Error) -> Self {
+        BuildError::JsonError(error)
+    }
+}
+
+/*
 metadata["Table"]: the table name (string)
 
 metadata["Max Values Per Block"]: the maximum number of values in each block (int)
@@ -91,7 +141,7 @@ pub struct Column {
 #[serde(rename_all = "PascalCase")]
 pub struct Metadata {
     table: String,
-    #[serde( deserialize_with = "column_maker")]
+    #[serde(deserialize_with = "column_maker")]
     columns: HashMap<String, Column>,
     #[serde(rename = "Max Values Per Block")]
     max_values_per_block: u32,
@@ -116,45 +166,44 @@ where
             let column: Column = serde_json::from_value(value).unwrap();
             map.insert(key.clone(), column.clone());
 
-            COLUMN_META.lock().unwrap().insert(column.start_offset, ColumnMeta {
-                column_name: key,
-                column_type: column.column_type.clone(),
-                // FIXME: change this into dynamically calculated value
-                elem_size: match column.column_type.as_str() {
-                    "float" => 4,
-                    "int" => 4,
-                    "str" => 32,
-                    _ => panic!("Invalid column type"),
+            COLUMN_META.lock().unwrap().insert(
+                column.start_offset,
+                ColumnMeta {
+                    column_name: key,
+                    column_type: column.column_type.clone(),
+                    // FIXME: change this into dynamically calculated value
+                    elem_size: match column.column_type.as_str() {
+                        "float" => 4,
+                        "int" => 4,
+                        "str" => 32,
+                        _ => panic!("Invalid column type"),
+                    },
                 },
-            });
+            );
         }
     }
     Ok(map)
 }
 
-
-impl<'par> Parser<'par> {
-    pub fn new(filename: String, tablename: String) -> Parser<'par> {
-        Parser {
+impl ParserBuilder {
+    pub fn new(filename: String, tablename: String) -> ParserBuilder {
+        ParserBuilder {
             filename: filename,
             tablename: tablename,
-            data: Vec::new(),
-            column_raw: HashMap::new(),
         }
     }
 
-    fn read_file_contents(filename: &str) -> Result<Vec<u8>, std::io::Error> {
+    fn read_file_contents(filename: &str, data: &mut Vec<u8>) -> Result<(), BuildError> {
         let mut file = File::open(filename)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        Ok(buffer)
+        file.read_to_end(data);
+        Ok(())
     }
 
-    // pushdowns: qual and sort. 
-    // qual stores an index, 
+    // pushdowns: qual and sort.
+    // qual stores an index,
     // sort needs an array of index, so we save indexes to b+ trees.
-    fn parse_raw (rawdata: &'par [u8], tempraw: &'par mut HashMap<usize, &'par[u8]>) {
-        let rawb = &*(COLUMN_META.lock().unwrap()); 
+    fn parse_raw<'par>(rawdata: &'par [u8], column_raw: &'par mut HashMap<usize, &'par [u8]>) {
+        let rawb = &*(COLUMN_META.lock().unwrap());
         let mut offsets = vec![];
         rawb.keys().for_each(|k| {
             offsets.push(k);
@@ -164,45 +213,65 @@ impl<'par> Parser<'par> {
         println!("{:#?}", offsets);
         let mut curdata = rawdata;
         offsets.windows(2).for_each(|w| {
-            let (i, o) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
-                w[1] - w[0])(curdata).unwrap();
+            let (i, o) =
+                take::<usize, &[u8], nom::error::Error<&[u8]>>(w[1] - w[0])(curdata).unwrap();
             curdata = i;
-            tempraw.insert(*w[0], o);
-        }); 
-        println!("{:?}", tempraw);
-
+            column_raw.insert(*w[0], o);
+        });
+        println!("{:?}", column_raw);
     }
 
-    pub fn parse(&'par mut self) {
-        // three sections: raw meta and size
-        self.data = Parser::read_file_contents(&self.filename).unwrap();
-        let body_bytes = &self.data[..];
-        let (i, o) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
-            body_bytes.len() - 4)(body_bytes).unwrap();
+    pub fn build_index(&mut self) -> &mut Self {
+        todo!()
+    }
+
+    pub fn build<'par>(&mut self) -> Result<Parser, BuildError> {
+        let mut data = Vec::new();
+        ParserBuilder::read_file_contents(&self.filename, &mut data)?;
+        let body_bytes = &data[..];
+        let (i, o) =
+            take::<usize, &[u8], nom::error::Error<&[u8]>>(body_bytes.len() - 4)(body_bytes)
+                .unwrap();
         println!("i: {:?}", i);
         println!("o: {:?}", o);
         let size: u32 = u32::from_le_bytes(i.try_into().unwrap());
         println!("{}", size);
-        let (meta, raw) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
-            o.len() - size as usize)(o).unwrap();
+        let (meta, raw) =
+            take::<usize, &[u8], nom::error::Error<&[u8]>>(o.len() - size as usize)(o).unwrap();
         let json_str = std::str::from_utf8(meta).expect("DB721|Metadata: Invalid MetaData format");
         println!("json_str: {:?}", json_str);
-        let json_struct: Metadata = serde_json::from_str(json_str).expect("DB721|Metadata: Invalid json format");
+        let json_struct: Metadata =
+            serde_json::from_str(json_str).expect("DB721|Metadata: Invalid json format");
         println!("meta_struct: {:#?}", json_struct);
-        println!("{:?}",COLUMN_META.lock().unwrap());
+        println!("{:?}", COLUMN_META.lock().unwrap());
         println!("raw size: {}", raw.len());
+        //ParserBuilder::parse_raw(raw, &mut column_raw);
+        let rawb = &*(COLUMN_META.lock().unwrap());
+        let mut offsets = vec![];
+        rawb.keys().for_each(|k| {
+            offsets.push(k);
+        });
+        let len = raw.len();
+        offsets.push(&len);
+        println!("{:#?}", offsets);
 
-        let tempraw = &mut self.column_raw;
-        Parser::parse_raw(raw, tempraw);
-        //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
-            //24)(raw).unwrap();
-        //let (f, s) = take::<usize, &[u8], nom::error::Error<&[u8]>> (
-            //192)(s).unwrap();
-        //let name_str = std::str::from_utf8(s).expect("DB721|Metadata: Invalid MetaData format");
-        //println!("name_str: {:?}", name_str);
-        // float(4) str(32) float(4)
+        let astcell = AstCell::new(raw.to_vec(), |raw_data| {
+            let raw = raw_data.as_slice();
+            let mut column_raw = HashMap::new();
+            let mut curdata = raw;
+            offsets.windows(2).for_each(|w| {
+                let (i, o) =
+                    take::<usize, &[u8], nom::error::Error<&[u8]>>(w[1] - w[0])(curdata).unwrap();
+                curdata = i;
+                column_raw.insert(*w[0], o);
+            });
+            ColRaw(column_raw)
 
-        
+            });
 
+        Ok(Parser::new(
+            self.tablename.clone(),
+            astcell,
+        ))
     }
 }
