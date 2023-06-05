@@ -3,3 +3,7 @@ members = [
 	"db721-parser",
 	"db721-gen"
 ]
+
+exclude = [
+	"db721_fdw"
+]
