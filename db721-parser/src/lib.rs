@@ -18,6 +18,6 @@ mod tests {
         let owner = parser.data.borrow_owner();
         let dep = parser.data.borrow_dependent();
         println!("{:#?}",owner);
-        println!("{:#?}",dep.0.get(&0));
+        println!("{:#?}",dep);
     }
 }

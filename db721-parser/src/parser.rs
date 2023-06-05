@@ -37,7 +37,7 @@ lazy_static!(
 );
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct ColRaw<'a>(pub HashMap<usize, &'a [u8]>);
+pub struct ColRaw<'a>(pub HashMap<String, &'a [u8]>);
 
 self_cell!(
     pub struct AstCell {
@@ -199,27 +199,6 @@ impl ParserBuilder {
         Ok(())
     }
 
-    // pushdowns: qual and sort.
-    // qual stores an index,
-    // sort needs an array of index, so we save indexes to b+ trees.
-    fn parse_raw<'par>(rawdata: &'par [u8], column_raw: &'par mut HashMap<usize, &'par [u8]>) {
-        let rawb = &*(COLUMN_META.lock().unwrap());
-        let mut offsets = vec![];
-        rawb.keys().for_each(|k| {
-            offsets.push(k);
-        });
-        let len = rawdata.len();
-        offsets.push(&len);
-        println!("{:#?}", offsets);
-        let mut curdata = rawdata;
-        offsets.windows(2).for_each(|w| {
-            let (i, o) =
-                take::<usize, &[u8], nom::error::Error<&[u8]>>(w[1] - w[0])(curdata).unwrap();
-            curdata = i;
-            column_raw.insert(*w[0], o);
-        });
-        println!("{:?}", column_raw);
-    }
 
     pub fn build_index(&mut self) -> &mut Self {
         todo!()
@@ -243,16 +222,22 @@ impl ParserBuilder {
         let json_struct: Metadata =
             serde_json::from_str(json_str).expect("DB721|Metadata: Invalid json format");
         println!("meta_struct: {:#?}", json_struct);
-        println!("{:?}", COLUMN_META.lock().unwrap());
         println!("raw size: {}", raw.len());
-        //ParserBuilder::parse_raw(raw, &mut column_raw);
-        let rawb = &*(COLUMN_META.lock().unwrap());
+
+        // parse raw
+        // pushdowns: qual and sort.
+        // qual stores an index,
+        // sort needs an array of index, so we save indexes to b+ trees.
         let mut offsets = vec![];
-        rawb.keys().for_each(|k| {
-            offsets.push(k);
-        });
+        {
+            let cm = COLUMN_META.lock().unwrap();
+            let rawb = &*cm;
+            rawb.keys().for_each(|k| {
+            offsets.push(*k);
+            });
+        } 
         let len = raw.len();
-        offsets.push(&len);
+        offsets.push(len);
         println!("{:#?}", offsets);
 
         let astcell = AstCell::new(raw.to_vec(), |raw_data| {
@@ -263,10 +248,13 @@ impl ParserBuilder {
                 let (i, o) =
                     take::<usize, &[u8], nom::error::Error<&[u8]>>(w[1] - w[0])(curdata).unwrap();
                 curdata = i;
-                column_raw.insert(*w[0], o);
+                column_raw.insert({
+                    let cm = COLUMN_META.lock().unwrap();
+                    let meta = cm.get(&w[0]).unwrap();
+                    meta.column_name.to_string()
+                }, o);
             });
             ColRaw(column_raw)
-
             });
 
         Ok(Parser::new(
